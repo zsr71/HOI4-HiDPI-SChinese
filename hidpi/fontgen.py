@@ -17,6 +17,8 @@ def marker(width, fill):
 
 
 def fill_level(atlas, spec):
+    if spec.solid:
+        return 1.0
     if spec.redraw:
         return spec.fill
     if spec.effects:
@@ -39,6 +41,7 @@ class FontSpec:
     redraw: bool = False   # draw glyphs straight from the outline font with a synthesised shadow
     fill: float = 1.0      # redrawn fonts: grey level of the glyph fill
     shadow: tuple | None = None  # redrawn fonts: (dx, dy, sigma, strength) in 1x pixels
+    solid: bool = False  # white fill coverage only; discard source shadow/outline effects
 
 
 @dataclass
@@ -84,7 +87,15 @@ def _glyph_cell(g, tex, spec):
     cell = np.pad(tex[g.y:g.y + g.h, g.x:g.x + g.w], ((PAD, PAD), (PAD, PAD), (0, 0)))
     if cell[..., 3].max() < 1.0 / 255.0:
         return None
-    return cell, fill_target(cell, spec.effects)
+    target = fill_target(cell, spec.effects)
+    if spec.solid and spec.effects and target.max() <= 0.2:
+        # A few thin rules use a grey fill below the usual effects threshold.
+        # Recover their visible fill without treating the opaque black shadow
+        # as a stroke, otherwise those valid characters become blank.
+        visible = cell[..., 3] * luminance(cell)
+        if visible.max() > 0:
+            target = visible / visible.max()
+    return cell, target
 
 
 def font_shift(font, tex, spec, ttf, sample=48):
@@ -144,9 +155,14 @@ def convert_glyph(g, tex, base, spec, ttf, shift):
         color_known *= np.clip((luminance(cell) - 0.2) / 0.2, 0, 1)
     if color_known.max() <= 0:
         color_known = (alpha > 0.1).astype(np.float32)
-    fill_rgb = np.clip(upscale2x(inpaint(cell[..., :3], color_known), method=Image.BILINEAR), 0, 1)
+    if spec.solid:
+        # CJK source atlases contain a grey baked-in shadow in RGB. UI text colours should
+        # be applied to a white glyph, with the glyph shape carried by alpha alone.
+        fill_rgb = np.ones(m2.shape + (1,), dtype=np.float32)
+    else:
+        fill_rgb = np.clip(upscale2x(inpaint(cell[..., :3], color_known), method=Image.BILINEAR), 0, 1)
 
-    if spec.effects:
+    if spec.effects and not spec.solid:
         bright = np.clip((luminance(cell) - 0.35) / 0.2, 0, 1) * np.clip(alpha * 4, 0, 1)
         fx_known = np.clip(1 - m1 * 20, 0, 1) * (1 - bright)
         fx = inpaint(premultiply(cell), fx_known)
@@ -285,3 +301,68 @@ def build_atlas(font: BMFont, tex, spec: FontSpec):
             atlas[cy, cx] = marker(atlas.shape[1], fill)
 
     return BMFont(dict(font.info), dict(font.common), glyphs, list(font.kernings)), atlas, counts, (width, height)
+
+
+def split_atlas(font: BMFont, atlas, page_width=1024, page_height=1024):
+    """Repack a generated 2x atlas into pages no larger than 2048x2048 pixels.
+
+    The game accepts the normal Latin 2x atlases but rejects the larger Chinese
+    pages.  Glyph coordinates remain in 1x BMFont units; only the generated
+    texture is split into additional pages.
+    """
+    # Keep a complete 4x4 texture block for the marker.  CJK pages are stored as
+    # DXT5, whose 4x4 blocks can otherwise blend the single marker texel with
+    # transparent neighbours before text.shader samples it.
+    gap = 2
+    scale = 2
+    items = []
+    for glyph in font.glyphs:
+        if glyph.w <= 0 or glyph.h <= 0:
+            continue
+        x0, y0 = glyph.x * scale, glyph.y * scale
+        x1, y1 = x0 + glyph.w * scale, y0 + glyph.h * scale
+        crop = atlas[y0:y1, x0:x1].copy()
+        items.append((glyph, crop))
+    items.sort(key=lambda item: (-item[0].h, -item[0].w, item[0].id))
+
+    pages = []
+    placements = []
+    page = -1
+    x = y = shelf = 0
+    for glyph, crop in items:
+        if glyph.w + gap * 2 > page_width or glyph.h + gap * 2 > page_height:
+            raise ValueError(f'glyph {glyph.id} does not fit the CJK page limit')
+        if page < 0 or x + glyph.w + gap > page_width:
+            x, y, shelf = gap, y + shelf + gap, 0
+        if page < 0 or y + glyph.h + gap > page_height:
+            pages.append(np.zeros((page_height * scale, page_width * scale, 4), dtype=np.float32))
+            page = len(pages) - 1
+            x, y, shelf = gap, gap, 0
+        placements.append((page, glyph, crop, x, y))
+        x += glyph.w + gap
+        shelf = max(shelf, glyph.h)
+
+    if not pages:
+        pages.append(np.zeros((page_height * scale, page_width * scale, 4), dtype=np.float32))
+    glyph_lists = [[] for _ in pages]
+    for page, glyph, crop, x, y in placements:
+        pages[page][y * scale:(y + glyph.h) * scale,
+                    x * scale:(x + glyph.w) * scale] = crop
+        glyph_lists[page].append(replace(glyph, x=x, y=y, page=0))
+
+    # Empty glyphs need a valid page entry too, even though they have no pixels.
+    for glyph in font.glyphs:
+        if glyph.w > 0 and glyph.h > 0:
+            continue
+        glyph_lists[0].append(replace(glyph, x=0, y=0, page=0))
+
+    result = []
+    for page, glyphs in enumerate(glyph_lists):
+        for cy in (0, -1):
+            for cx in (0, -1):
+                pages[page][cy, cx] = marker(page_width * scale, 1.0)
+        pages[page][:4, :4] = marker(page_width * scale, 1.0)
+        page_font = BMFont(dict(font.info), dict(font.common),
+                            sorted(glyphs, key=lambda glyph: glyph.id), list(font.kernings))
+        result.append((page_font, pages[page], page_width, page_height))
+    return result

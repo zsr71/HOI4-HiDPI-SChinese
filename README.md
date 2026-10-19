@@ -1,148 +1,121 @@
-# HiDPI Text for Hearts of Iron IV
+# 钢铁雄心 IV｜4K 高清中文字体
 
-Makes HOI4's UI readable on a 4K screen: run the game at native 3840×2160 with the in-game
-**UI Scaling (Experimental)** set to **2.0**, and this mod makes UI text render sharp instead of
-blurry. It works on both the DirectX 9 (legacy) and DirectX 11 renderers.
+针对 **3840 × 2160、UI Scaling 2.0、简体中文**制作的高清字体适配。
+基于 [Chris Spoelstra / cspoelstra 的 HOI4-HiDPI](https://github.com/cspoelstra/HOI4-HiDPI)，
+经原作者同意，以独立 fork 和 Mod 维护。
 
-**Get it on the [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3821059269)**, or build it from your own install (see
-[Building and installing](#building-and-installing)).
+[Steam 创意工坊](https://steamcommunity.com/sharedfiles/filedetails/?id=3822834833) ·
+[原项目文档](README.upstream.md) · [技术说明](docs/schinese/implementation.md)
 
-![decisions](docs/compare_decisions.png)
-![top bar](docs/compare_topbar.png)
-![tooltip](docs/compare_tooltip.png)
-![special project card](docs/compare_card.png)
+![封面](workshop/schinese/thumbnail.png)
 
-## Why the built-in scaling is blurry
+## 使用与支持范围
 
-HOI4 draws text from bitmap fonts (`gfx/fonts/*.fnt` + a glyph texture). At UI scale 2.0 every
-16px glyph is stretched to 32 screen pixels with bilinear filtering, which looks soft.
+1. 在启动器中启用本模组，使用简体中文。
+2. 分辨率设为 **3840 × 2160**，**UI Scaling (Experimental)** 设为 **2.0**，重新启动游戏。
+3. 本模组已包含所需高清字体和着色器，无需额外订阅原版 HiDPI Text。
 
-You can't simply drop in a sharper texture, because the engine computes glyph texture coordinates from
-the texture's actual size, not from the `.fnt` header. A 2× texture shows the wrong glyphs.
+实测环境为 **Windows、HOI4 1.19.3、DirectX 11、4K、UI 2.0**。
+用户已完成独立安装及多轮游戏内界面检查。其他分辨率、缩放、渲染器、版本、系统及大型模组
+尚未完整验证；不据原项目的测试推断本中文版也支持。铁人模式与成就兼容性尚未单独验证。
 
-## What the mod does
+替换相同字体、`gfx/FX` 着色器或同名 `interface` 文件的模组可能冲突。
+日文、韩文与繁体中文不在本版本支持目标中。
 
-1. **2× font atlases.** Every UI font is regenerated at twice the resolution. The `.fnt` metrics
-   (advance widths, kerning, line height) are kept exactly as in vanilla, so every window lays out the
-   same as before. Only the pixels get sharper.
-   - Glyphs are rendered from the real outline fonts where available. The fonts and sizes were found by
-     fitting rendered glyphs to the vanilla bitmaps:
-     - Ubuntu: most of the UI.
-     - URW Gothic, the metric twin of Century Gothic: tooltips.
-     - Liberation Sans / Serif: the Arial and Times fonts.
-   - The special-project typewriter font (AFL Font) has no freely licensed outlines, and traced from
-     its 16px bitmaps it came out lumpy and uneven. It's drawn from Podkova instead, the openly licensed
-     slab serif that fits its shapes best, at weights matching the vanilla strokes. Each glyph is centred
-     on where the vanilla glyph sat, so the original spacing still fits.
-   - Baked-in effects are kept: the metallic gradients, bevels and drop shadows are separated from the
-     glyph fill, upscaled, and composited under the crisp fill.
-   - Fonts with no free outline available (the Orator headers and the Garamonds) are vectorised from the game's own bitmaps with potrace, then rendered at 2×. This keeps their exact
-     look with clean edges.
-2. **Patched `gfx/FX/text.shader`.** The generated atlases carry a magic value in their four corner
-   texels. The text shader checks for it and doubles the texture coordinates only for those textures.
-   Other sprites that go through the same shader, such as the main menu buttons and inline text icons,
-   are unaffected. At UI scale 2.0 one atlas texel lands on exactly one screen pixel.
-3. **DX9 alignment fix.** At UI scale 2.0 the DX9 renderer samples every UI texture half a screen
-   pixel off. That averages the 2× glyphs back down to 1× detail and makes magnified UI art look
-   stair-stepped. The patched shaders shift sampling back onto texel centres (DX9 only).
-4. **Sharpened UI art.** `text.shader` (non-font textures) and the `buttonstate*.shader` family that
-   draws nearly all UI sprites apply AMD FSR 1's RCAS sharpening to the 2× magnified art.
-5. **2× text in tooltips and labelled buttons.** The engine draws tooltips, and buttons whose label is
-   baked into the button image (`textSpriteType`, e.g. the main menu), into an offscreen buffer at 1×
-   (1920×1080 scale), then stretches that 2×. Plain 2× fonts can't survive that, so the shaders carry the
-   detail through the buffer instead:
-   - `text.shader` notices when it draws into such a buffer (one UI unit per pixel). For each pixel of
-     a glyph it stores the coverage of the four 2× sub-pixels under it (3 bits each) and the text
-     colour (4 bits per channel) in place of the blended colour. These texels get alpha 255; everything
-     else it draws there stays below 255. Texel (0,0) gets a marker colour and texel (0,1) the colour
-     of the background art.
-   - The shaders that draw the buffer to the screen (`buttonstate*.shader`, and `text.shader` on DX11)
-     look for the marker. If it's there, they draw each text texel as 2×2 screen pixels from its
-     sub-pixel coverage, over the surrounding background.
-   - Fonts with baked effects (bevels, outlines) are still drawn the vanilla way there, at 1×.
-6. **Redrawn tooltip font.** The tooltip font (`cg_16b` + `hoi_16tooltip3`) is drawn straight from URW
-   Gothic with the vanilla fill and drop shadow re-created, so the shaders know its fill colour.
-   Inside tooltips the text is drawn without the drop shadow, which was barely visible on the dark
-   tooltip background.
+## 实机对比
 
-The patched shaders are generated from the installed game's own copies at build time. The mod
-overrides `gfx/fonts/*`, `gfx/FX/text.shader` and `gfx/FX/buttonstate*.shader`. It conflicts with
-mods that replace those same files.
+左侧原版，右侧中文高清版。截图由玩家提供，按原始像素尺寸并排，仅增加标题栏；
+未额外锐化或人为模糊任何一侧。两侧原始裁切边界略有差异。
 
-## Not covered
+![主菜单](docs/schinese/compare-menu.png)
+![事件和决议](docs/schinese/compare-decisions.png)
+![国策](docs/schinese/compare-focus.png)
+![剧本选择](docs/schinese/compare-scenario.png)
 
-- Only tested at UI scale 2.0 on a 3840×2160 screen, with the DX9 and DX11 renderers. Other UI scales and
-  resolutions haven't been tested.
-- Tooltip and button text keeps 8 levels of anti-aliasing per pixel instead of 256. That doesn't
-  show at this size, but it is a limit.
-- Button labels in fonts with baked effects (e.g. the main menu's header font) stay 1× in their
-  offscreen buffer, as in vanilla.
-- Icons and other UI art are still 1× bitmaps; sharpening helps, but they're not truly high-res.
-- Map labels (country, state and arrow text) use separate map shaders and fonts. They're untouched;
-  they're world-space and scale with zoom anyway.
-- Chinese, Japanese and Korean fonts (`gfx/fonts/{chinese,japanese,korean}`) are untouched.
+## 源码内容与状态
 
-## Building and installing
+- `build_mod.py`、`hidpi/`：中文字体轮廓重绘、图集拆页、纯填充处理及基础界面映射源码。
+- `schinese/release-patches.json`：最终 117 个界面/着色器文本文件的源变更及 111 个字体对齐别名参数。
+  原游戏未修改的部分从用户本机读取；原游戏完整文件不上传。
+- `schinese/apply_release_patches.py`：应用上述变更，输入/输出哈希不匹配时停止。
+- `schinese/accepted-payload.json`、`schinese/verify_release.py`：1082 个已验收运行文件的 SHA-256 清单与检查工具。
+- `fonts/NotoSansSC-SemiBold.ttf`：测试使用的 Noto Sans SC 字重 600 静态实例，附 OFL 授权。
+- `tests/`：字体填充、拆页及源补丁回归检查。
+- `workshop/schinese/`：中文封面和介绍；上游 `workshop/` 资源保留。
 
-Requirements: Python 3 with `numpy`, `Pillow` and `fontTools`; `fc-match` (fontconfig); `potrace`; and
-the Ubuntu, URW Gothic (`gsfonts`) and Liberation font packages. A missing outline font isn't fatal:
-those fonts are traced from their bitmaps instead and the script prints a warning. Podkova is
-bundled in `fonts/`. Without potrace, bitmap fonts fall back to a simpler, softer upscaler.
+**构建状态：**验收包经历多阶段构建与游戏内修正。基础生成器、最终源补丁和结果清单均已收录，
+但尚未整理并验证“一条命令从零生成与验收包逐文件相同结果”的完整流程。
+下列基础字体构建是开发入口，不能当作验收安装包的等价替代。
+最终补丁会检查游戏文件版本；字体别名还需要验收包中的基础字体资源。
+生成的 DDS/TGA 大图集、个人目录、临时回退文件及游戏原文件不在 Git 中。
+
+## 开发构建
+
+使用 Python **3.11 或更新版本**：
 
 ```bash
-python3 build_mod.py --install
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+python build_mod.py --help
 ```
 
-This builds into `./dist/hidpi_text` and copies it to the Proton prefix's HOI4 user directory
-(`compatdata/394360/pfx/drive_c/users/steamuser/Documents/Paradox Interactive/Hearts of Iron IV/mod`),
-together with a `hidpi_text.mod` descriptor. Use `--install <user dir>` for another location, such as a
-native install's `~/.local/share/Paradox Interactive/Hearts of Iron IV`. Use `--game <dir>` if the game
-isn't in the default Steam library.
+完整构建沿用上游对 `fontconfig`（`fc-match`）、`potrace`、Ubuntu / URW Gothic / Liberation
+字体包的依赖；建议在 Linux 或 WSL 中配置。CJK 选择 `dxt5` 格式时还需要 ImageMagick 的 `magick`。
+缺少上游轮廓字体会回退为位图描摹，生成结果会不同。
 
-Rebuild after game patches. The script reads fonts and shaders from the installed game, and stops
-with an error if a shader changed in a way it doesn't recognise.
+先生成一组基础中文字体进行开发检查（将游戏路径换成自己的路径）：
 
-## In-game setup
+```bash
+python build_mod.py --game "/path/to/Hearts of Iron IV" \
+  --cjk-font fonts/NotoSansSC-SemiBold.ttf \
+  --cjk-groups standard --cjk-dds-format raw --jobs 2 --out ./dist-schinese
+```
 
-1. Subscribe on the [Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3821059269), or build and install it yourself. Then enable
-   **HiDPI Text (2x)** in a playset in the Paradox launcher.
-2. In the launcher's game settings, set the resolution to **3840×2160** (fullscreen or borderless).
-3. In the in-game settings, set **UI Scaling (Experimental)** to **2.0**. Alternatively, set
-   `gui_scale=2.000000` in `settings.txt` in the user directory above.
+省略 `--cjk-groups` 将构建所有受支持中文 UI 字体组，耗时和内存需求显著增加。
+默认中文 Mod 目录为 `dist-schinese/hoi4_hidpi_schinese`。
+此命令不修改已安装 Mod；不要用开发输出覆盖验收版本。
+`--install` 会替换同名已安装 Mod，仅在备份后对自己的测试目录使用。
 
-Uninstall: disable the mod, then delete `mod/hidpi_text` and `mod/hidpi_text.mod`.
+最终界面与着色器补丁可以单独复核，输出目录必须不存在：
 
-## Publishing to the Steam Workshop
+```bash
+python -m schinese.apply_release_patches --game "/path/to/Hearts of Iron IV" \
+  --out ./dist-schinese-text-overlay --text-only
+```
 
-1. Build and install it with `python3 build_mod.py --install`. The built mod includes `thumbnail.png`
-   (from `workshop/`), `CREDITS.txt` and the font licences.
-2. In the Paradox launcher, upload **HiDPI Text (2x)** from the mods section and paste
-   `workshop/description.bbcode` as the description.
-3. The launcher adds the Workshop item's `remote_file_id` to `mod/hidpi_text.mod`. `--install` keeps it,
-   so later uploads update the same item.
+同时重建已验收字体的对齐别名时，提供解包后 Mod 根目录：
 
-Rebuild and upload again after game patches that change `text.shader` or the `buttonstate` shaders.
+```bash
+python -m schinese.apply_release_patches --game "/path/to/Hearts of Iron IV" \
+  --base-mod "/path/to/accepted/hoi4_hidpi_schinese" --out ./dist-schinese-overlay
+python -m schinese.verify_release "/path/to/accepted/hoi4_hidpi_schinese"
+```
 
-## Layout
+补丁输出仅为需叠加至基础 Mod 的文件集合，**不是可独立启用的完整 Mod**。
+工具不修改游戏安装目录或提供的基础 Mod。
+游戏更新或重新生成字体布局导致哈希变化时，需要审查并更新补丁记录，不能强行套用。
 
-- `build_mod.py`: entry point; font→outline mapping, mod packaging and install.
-- `hidpi/bmfont.py`: BMFont `.fnt` reader/writer and DDS writer.
-- `hidpi/ttf.py`: supersampled glyph rasteriser on top of Pillow/FreeType.
-- `hidpi/fontgen.py`: per-glyph 2× conversion (alignment, effect separation, compositing) and atlas
-  packing.
-- `hidpi/trace.py`: potrace-based vectorisation of bitmap glyphs.
-- `hidpi/imageops.py`: inpainting, 2× resampling, fallback bitmap upscaling.
-- `hidpi/preview.py`: offline before/after renderer for tuning, without starting the game.
-- `fonts/`: bundled outline fonts.
-- `licenses/`: licence texts of the outline fonts, shipped with the mod.
-- `workshop/`: Workshop thumbnail and description.
+## 授权与反馈
 
-## License
+代码沿用 [MIT](LICENSE)，保留原作者署名。
+中文适配与测试：七海从小就很可爱 / [zsr71](https://github.com/zsr71)。
+Noto Sans SC 使用 [SIL Open Font License 1.1](licenses/NotoSansSC-OFL.txt)，
+静态实例来自 [Google Fonts Noto Sans SC](https://github.com/google/fonts/tree/main/ofl/notosanssc)。
+Podkova 及其他上游字体许可见 `licenses/` 和[上游文档](README.upstream.md#license)。
+游戏截图、由游戏文件衍生的补丁内容和其他游戏资产的权利仍属于 Paradox Interactive；
+它们不因代码使用 MIT 而变为 MIT 资产。
 
-The code is MIT; see [LICENSE](LICENSE). Podkova (`fonts/`) is © The Podkova Project Authors under the
-SIL Open Font License 1.1; see [licenses/Podkova-OFL.txt](licenses/Podkova-OFL.txt).
+反馈缺字、模糊或位置异常时，请在 Issues 附游戏版本、分辨率、UI 缩放、渲染器、
+同时启用的字体/界面模组和对应页面截图。
 
-The generated mod contains material derived from Hearts of Iron IV assets, which remain the property of
-Paradox Interactive. Its font textures are distributed under the licence of the outline font each was
-drawn from; the build writes the details to the mod's `CREDITS.txt` and copies the licence texts from
-`licenses/`.
+## English
+
+This is an independent Simplified Chinese adaptation of
+[cspoelstra/HOI4-HiDPI](https://github.com/cspoelstra/HOI4-HiDPI), published with the original author's permission.
+Tested on Windows, HOI4 1.19.3, DX11, 3840×2160 and UI scale 2.0.
+It includes the Chinese atlas generator, final shader/UI source edits, font alignment recipes,
+licences and real in-game comparisons. The generator is a development entry point: an end-to-end,
+byte-identical rebuild of the accepted multi-stage package has not yet been established.
+The final patch tool reads the user's installed game and checks input/output hashes;
+alias reconstruction additionally requires the accepted base fonts.
+See [implementation notes](docs/schinese/implementation.md) and the [upstream README](README.upstream.md).

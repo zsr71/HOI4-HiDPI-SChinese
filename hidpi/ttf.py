@@ -28,7 +28,7 @@ class TTFGlyphs:
 
     @lru_cache(maxsize=8)
     def _font(self, px):
-        return ImageFont.truetype(self.path, size=px)
+        return ImageFont.truetype(self.path, size=int(round(px)))
 
     def render(self, cp, cell_w, cell_h, pen_x, base_y, scale=1, ss=8):
         """Coverage of glyph `cp` in a cell of `cell_w`x`cell_h` 1x pixels, rendered at `scale`x.

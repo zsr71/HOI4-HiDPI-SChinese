@@ -18,7 +18,7 @@ from fontTools.varLib.instancer import instantiateVariableFont
 from PIL import Image
 
 from hidpi.bmfont import load_rgba, read_fnt, save_dds_rgba, write_fnt
-from hidpi.fontgen import FontSpec, build_atlas
+from hidpi.fontgen import FontSpec, build_atlas, split_atlas
 from hidpi.imageops import luminance
 
 MOD_NAME = 'HiDPI Text (2x)'
@@ -30,10 +30,16 @@ PROTON_DOCS_WIN = 'C:/users/steamuser/Documents/Paradox Interactive/Hearts of Ir
 REPO = Path(__file__).parent
 FONTS = REPO / 'fonts'
 LICENSES = REPO / 'licenses'
-REPO_URL = 'https://github.com/cspoelstra/HOI4-HiDPI'
+REPO_URL = 'https://github.com/zsr71/HOI4-HiDPI-SChinese'
+UPSTREAM_URL = 'https://github.com/cspoelstra/HOI4-HiDPI'
 
 # Drawn in world space by the map shaders, not text.shader.
 SKIP = {'hoi_mapfont4', 'hoi_arrow_font'}
+
+# Chinese fonts are split across several atlas pages and are referenced from
+# core_chinese.gfx as gfx/fonts/chinese/<name>.  Map labels and arrow fonts use
+# different shaders, so leave those on the vanilla path for now.
+LANGUAGE_DIRS = {'chinese'}
 
 # Outline fonts and em sizes (1x pixels) that best reproduce each vanilla bitmap font, found by
 # maximising the correlation between rendered and original glyphs. Fonts not listed here are traced
@@ -220,7 +226,12 @@ TEXT_PATCH = f'''// Font atlases from the HiDPI Text mod are stored at twice the
 			// and carry red, alpha 1/255 corner texels (hidpi/fontgen.py). The engine derives glyph UVs from
 			// the real texture size, so for those textures the UVs come out halved.
 			float4 vHdTag = tex2Dlod0( SimpleTexture, float2( 0.0, 0.0 ) );
-			bool bHdFont = vHdTag.r > 0.99 && vHdTag.a > 0.5 / 255.0 && vHdTag.a < 1.5 / 255.0;
+			// The CJK pages may be DXT5-compressed to stay within the game's texture
+			// memory limits. Compression can slightly change the marker alpha, so
+			// identify the full red/green/blue marker signature instead of requiring
+			// an exact 1/255 alpha value.
+			bool bHdFont = vHdTag.r > 0.99 && vHdTag.g > 0.10 && vHdTag.g < 0.65 &&
+				vHdTag.b > 0.99 && vHdTag.a > 0.0001 && vHdTag.a < 0.99;
 			float2 vHdUV = v.vTexCoord * ( bHdFont ? 2.0 : 1.0 );
 			// Drawing into a 1x render target (see BEACON in build_mod.py): one UI unit per pixel, and
 			// narrower than any screen.
@@ -234,7 +245,9 @@ TEXT_PATCH = f'''// Font atlases from the HiDPI Text mod are stored at twice the
 			float fHdTexelsPerPixel = bHdFont ? ddx( vHdUV ).x * exp2( floor( vHdTag.g * 32.0 + 0.5 ) ) : 1.0;
 			vHdUV += bHdTarget ? 0.0 : saturate( 2.0 - fHdTexelsPerPixel ) * 0.5 * float2( ddx( vHdUV ).x, ddy( vHdUV ).y );
 #endif
-		    float4 OutColor = tex2D( SimpleTexture, vHdUV );
+			// Keep 2x font atlases on their full-resolution mip level. The game-generated
+			// mip chain can otherwise soften glyphs when derivatives select a lower level.
+		    float4 OutColor = bHdFont ? tex2Dlod0( SimpleTexture, vHdUV ) : tex2D( SimpleTexture, vHdUV );
 			float4 vHdPlain = OutColor * v.vColor;
 			// Other textures through here are magnified UI art, and on DX11 the render targets.
 			{rcas('SimpleTexture')}
@@ -296,10 +309,32 @@ SHADER_PATCHES = {
 }
 
 
-def referenced_fonts(game):
+def _font_base(name):
+    return Path(name).name
+
+
+def _skip_font(name):
+    base = _font_base(name)
+    return base in SKIP or base.startswith('hoi_mapfont4_') or base.startswith('hoi_arrow_font_')
+
+
+def referenced_fonts(game, include_cjk=False, cjk_groups=None):
     text = ''.join(p.read_text(encoding='utf-8', errors='replace') for p in (game / 'interface').glob('*.gfx'))
     text = re.sub(r'#[^\n]*', '', text)
-    return sorted(set(re.findall(r'"gfx/fonts/([A-Za-z0-9_]+)"', text)) - SKIP)
+    names = set(re.findall(r'"gfx/fonts/([A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)?)"', text))
+    result = []
+    for name in names:
+        if _skip_font(name):
+            continue
+        if '/' in name:
+            language, _ = name.split('/', 1)
+            if language in LANGUAGE_DIRS and include_cjk and (
+                    cjk_groups is None or _font_base(name).rsplit('_', 1)[0] in cjk_groups or
+                    any(_font_base(name).startswith(group + '_') for group in cjk_groups)):
+                result.append(name)
+            continue
+        result.append(name)
+    return sorted(result)
 
 
 def font_file(pattern, cache):
@@ -327,31 +362,68 @@ def texture_path(fonts_dir, name):
     raise FileNotFoundError(name)
 
 
+def compress_cjk_dds(path):
+    """Use the same DXT5 format as vanilla Chinese font atlases."""
+    magick = shutil.which('magick')
+    if not magick:
+        raise RuntimeError('ImageMagick (magick) is required to write CJK DDS atlases')
+    compressed = path.with_name(path.stem + '.dxt5.dds')
+    source, target = str(path), str(compressed)
+    if os.name == 'posix' and Path(magick).resolve().suffix.lower() == '.exe':
+        source = subprocess.run(['wslpath', '-w', source], capture_output=True, text=True, check=True).stdout.strip()
+        target = subprocess.run(['wslpath', '-w', target], capture_output=True, text=True, check=True).stdout.strip()
+    subprocess.run([magick, source, '-define', 'dds:compression=dxt5', target], check=True)
+    compressed.replace(path)
+
+
 def has_effects(tex):
     a = tex[..., 3]
     dark = (a * (luminance(tex) < 0.35)).sum() / max(a.sum(), 1e-6)
-    return 0.15 < dark < 0.9
+    return bool(0.15 < dark < 0.9)
 
 
 def convert(args):
-    name, fonts_dir, out_dir, outline = args
+    name, fonts_dir, out_dir, outline, cjk_font, cjk_dds_format = args
     fnt = read_fnt(fonts_dir / (name + '.fnt'))
     tex = load_rgba(texture_path(fonts_dir, name))
     spec = FontSpec(effects=has_effects(tex))
-    if outline:
+    if name.startswith('chinese/'):
+        # Chinese glyphs already have a complete bitmap inventory in the game
+        # .fnt file.  Redraw those codepoints from a CJK outline font while
+        # keeping the original 1x metrics so UI layout stays unchanged.
+        spec.ttf = cjk_font
+        spec.em = abs(float(fnt.info.get('size', 16)))
+        spec.substitute = True
+        # Detect source effects for alignment and missing-outline glyphs, but
+        # output only the fill. Keeping the old alpha while whitening its RGB
+        # would turn the baked shadow into a bright halo.
+        spec.solid = True
+    elif outline:
         spec.ttf, spec.em = outline[0], outline[1]
         spec.embolden = outline[2] if len(outline) > 2 else 0.0
-        spec.substitute = isinstance(OUTLINES[name][0], tuple)
-        if name in REDRAWN:
+        base = _font_base(name)
+        spec.substitute = isinstance(OUTLINES[base][0], tuple)
+        if base in REDRAWN:
             spec.redraw = True
-            spec.fill = REDRAWN[name]['fill']
-            spec.shadow = REDRAWN[name]['shadow']
+            spec.fill = REDRAWN[base]['fill']
+            spec.shadow = REDRAWN[base]['shadow']
     new_fnt, atlas, counts, (w, h) = build_atlas(fnt, tex, spec)
-    write_fnt(out_dir / (name + '.fnt'), new_fnt, name + '.dds', w, h)
-    save_dds_rgba(out_dir / (name + '.dds'), atlas)
-    if (fonts_dir / (name + '.tga')).exists():
-        px = np.clip(np.rint(atlas * 255), 0, 255).astype(np.uint8)
-        Image.fromarray(px, 'RGBA').save(out_dir / (name + '.tga'), orientation=1)
+    target = out_dir / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pages = split_atlas(new_fnt, atlas) if name.startswith('chinese/') else [
+        (new_fnt, atlas, w, h)
+    ]
+    for index, (page_fnt, page_atlas, page_w, page_h) in enumerate(pages):
+        suffix = '' if len(pages) == 1 else f'_p{index + 1}'
+        page_target = out_dir / f'{name}{suffix}'
+        page_name = page_target.name + '.dds'
+        write_fnt(page_target.with_suffix('.fnt'), page_fnt, page_name, page_w, page_h)
+        save_dds_rgba(page_target.with_suffix('.dds'), page_atlas)
+        if name.startswith('chinese/') and cjk_dds_format == 'dxt5':
+            compress_cjk_dds(page_target.with_suffix('.dds'))
+        if len(pages) == 1 and (fonts_dir / (name + '.tga')).exists():
+            px = np.clip(np.rint(page_atlas * 255), 0, 255).astype(np.uint8)
+            Image.fromarray(px, 'RGBA').save(page_target.with_suffix('.tga'), orientation=1)
     return name, counts, spec
 
 
@@ -368,11 +440,144 @@ def write_patched(game, mod_root):
         dest.write_text(src, encoding='utf-8', errors='surrogateescape')
 
 
-def write_credits(mod_root, used):
+def write_cjk_interface_patches(game, mod_root, groups, pages_root=None):
+    """Point selected Chinese bitmap-font groups at their split atlas pages."""
+    pages_dir = Path(pages_root) if pages_root else mod_root / 'gfx/fonts/chinese'
+    replacements = {
+        'chatfonts.gfx': {'standard'},
+        'core_chinese.gfx': {
+            'garamond_14', 'garamond_14_bold', 'garamond_16', 'garamond_16_bold',
+            'cg_18b', 'hoi_16mbs', 'hoi_18', 'hoi_18mbs', 'hoi_20b', 'hoi_20bs',
+            'hoi_24header', 'hoi_30', 'hoi_30header', 'hoi_33', 'hoi_36header',
+            'vic_18', 'vic_22', 'vic_36', 'hoi_16typewriter', 'hoi4_typewriter22',
+            'hoi4_typewriter22_inverted'
+        },
+    }
+    for filename, names in replacements.items():
+        dest = mod_root / 'interface' / filename
+        if not names & groups:
+            continue
+        source = dest if dest.exists() else game / 'interface' / filename
+        text = source.read_text(encoding='utf-8', errors='surrogateescape')
+        for group in names & groups:
+            for page in range(1, 5):
+                for extension in ('', 'EX'):
+                    old = f'"gfx/fonts/chinese/{group}_{page}of4{extension}"'
+                    prefix = f'{group}_{page}of4{extension}_p'
+                    pages = sorted(pages_dir.glob(prefix + '*.fnt'))
+                    if not pages:
+                        continue
+                    new = '\n'.join(
+                        f'\t\t\t"gfx/fonts/chinese/{path.stem}"' for path in pages
+                    )
+                    if old in text:
+                        text = text.replace(old, new)
+                    else:
+                        existing_pages = re.compile(
+                            r'(?:\s*"gfx/fonts/chinese/' + re.escape(prefix) + r'\d+")+'
+                        )
+                        text = existing_pages.sub(new, text)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding='utf-8', errors='surrogateescape')
+
+
+def write_country_filter_patch(game, mod_root):
+    """Use the slightly larger CJK menu font for the continent filter buttons.
+
+    At 4K/UI scale 2 the 16px CJK glyphs are sampled at a fractional size and look
+    softer than the 20px country names. The filter cells have ample width for the
+    existing 18px bold font, so this local GUI override improves legibility without
+    changing the rest of the setup screen.
+    """
+    source = game / 'interface/frontendgamesetupview.gui'
+    text = source.read_text(encoding='utf-8', errors='surrogateescape')
+    pattern = (r'(name\s*=\s*"country_filter".*?buttonType\s*=\s*\{.*?'
+               r'buttonText\s*=\s*"FILTER"\s+buttonFont\s*=\s*)"hoi_16mbs"')
+    patched, count = re.subn(pattern, r'\1"hoi_18mbs"', text, count=1, flags=re.S)
+    if count != 1:
+        sys.exit('frontendgamesetupview.gui country_filter block not found')
+    dest = mod_root / 'interface/frontendgamesetupview.gui'
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(patched, encoding='utf-8', errors='surrogateescape')
+
+
+def write_national_focus_title_patch(game, mod_root):
+    """Use the larger CJK font for the two national-focus node titles.
+
+    Only the continuous and regular focus-node title textboxes are changed;
+    costs, search fields, tooltips, and rewards keep their original metrics.
+    """
+    source = game / 'interface/nationalfocusview.gui'
+    text = source.read_text(encoding='utf-8', errors='surrogateescape')
+    pattern = (r'(instantTextboxType\s*=\s*\{\s*'
+               r'name\s*=\s*"name"\s*'
+               r'position\s*=\s*\{\s*x\s*=\s*15\s*y\s*=\s*58\s*\}\s*'
+               r'font\s*=\s*)"hoi_16mbs"')
+    patched, count = re.subn(pattern, r'\1"hoi_18mbs"', text, count=2, flags=re.S)
+    if count != 2:
+        sys.exit('nationalfocusview.gui focus node title blocks not found')
+    dest = mod_root / 'interface/nationalfocusview.gui'
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(patched, encoding='utf-8', errors='surrogateescape')
+
+
+def write_gamesetup_details_patch(game, mod_root):
+    """Use the sharper regular 20px CJK font in the country details panel."""
+    dest = mod_root / 'interface/frontendgamesetupview.gui'
+    source = dest if dest.exists() else game / 'interface/frontendgamesetupview.gui'
+    text = source.read_text(encoding='utf-8', errors='surrogateescape')
+    section_re = (r'(name\s*=\s*"gamesetup_country_details".*?'
+                  r')(?=\n\s*containerWindowType\s*=\s*\{\s*\n?\s*'
+                  r'name\s*=\s*"gamesetup_multiplayer_settings_window")')
+    match = re.search(section_re, text, flags=re.S)
+    if not match:
+        sys.exit('frontendgamesetupview.gui country details block not found')
+    section = match.group(1)
+    patched_section, count = re.subn(r'(?<![A-Za-z0-9_])hoi_20bs(?![A-Za-z0-9_])', 'hoi_20b', section)
+    if count == 0:
+        sys.exit('frontendgamesetupview.gui country details font not found')
+    patched = text[:match.start(1)] + patched_section + text[match.end(1):]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(patched, encoding='utf-8', errors='surrogateescape')
+
+
+def write_gamesetup_difficulty_patch(game, mod_root):
+    """Use the sharper regular font for the lower-right difficulty heading."""
+    dest = mod_root / 'interface/frontendgamesetupview.gui'
+    source = dest if dest.exists() else game / 'interface/frontendgamesetupview.gui'
+    text = source.read_text(encoding='utf-8', errors='surrogateescape')
+    pattern = (r'(name\s*=\s*"difficulty_text".*?font\s*=\s*)"hoi_24header"')
+    patched, count = re.subn(pattern, r'\1"hoi_20b"', text, count=1, flags=re.S)
+    if count != 1:
+        sys.exit('frontendgamesetupview.gui difficulty heading not found')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(patched, encoding='utf-8', errors='surrogateescape')
+
+
+def write_font_replacements_patch(game, mod_root, relative_path, replacements):
+    """Apply exact font-name replacements to one vanilla GUI file."""
+    dest = mod_root / relative_path
+    source = dest if dest.exists() else game / relative_path
+    text = source.read_text(encoding='utf-8', errors='surrogateescape')
+    pattern = re.compile(r'(?P<key>font|buttonFont)(?P<gap>\s*=\s*)"(?P<name>'
+                         + '|'.join(re.escape(name) for name in replacements)
+                         + r')"')
+    def replace(match):
+        return (match.group('key') + match.group('gap') + '"' +
+                replacements[match.group('name')] + '"')
+    patched, count = pattern.subn(replace, text)
+    if count == 0:
+        sys.exit(f'{relative_path} has no target font references')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(patched, encoding='utf-8', errors='surrogateescape')
+
+
+def write_credits(mod_root, used, external_fonts=(), cjk_license=None):
     """CREDITS.txt and licence texts for the outline fonts in `used` ({font file: [game font names]})."""
     lines = [
         f'{MOD_NAME} for Hearts of Iron IV',
         REPO_URL,
+        'Based on Chris Spoelstra / cspoelstra: ' + UPSTREAM_URL,
         '',
         'The font textures (gfx/fonts) are redrawings of Hearts of Iron IV\'s fonts at twice the resolution,',
         'and the shaders (gfx/FX) are modified copies of the game\'s own. The game\'s assets remain the',
@@ -393,7 +598,22 @@ def write_credits(mod_root, used):
             shutil.copy(LICENSES / licence, mod_root / 'licenses' / licence)
         lines += ['', f'{family} ({Path(path).name})', '  ' + ' '.join(info.getDebugName(0).split()),
                   '  Licence: ' + ', '.join(FONT_LICENSES[family]), '  Used for: ' + ', '.join(sorted(names))]
-    (mod_root / 'CREDITS.txt').write_text('\n'.join(lines) + '\n')
+    for path in external_fonts:
+        with TTFont(path, lazy=True) as font:
+            info = font['name']
+            family = info.getDebugName(16) or info.getDebugName(1)
+            copyright_text = ' '.join((info.getDebugName(0) or '').split())
+        license_path = cjk_license
+        if license_path is None and family and family.startswith('Noto Sans SC'):
+            license_path = LICENSES / 'NotoSansSC-OFL.txt'
+        lines += ['', f'CJK outline source: {family} ({Path(path).name})',
+                  '  ' + copyright_text]
+        if license_path:
+            shutil.copy(license_path, mod_root / 'licenses' / 'CJK-font-license.txt')
+            lines += ['  Licence: licenses/CJK-font-license.txt']
+        else:
+            lines += ['  Supply --cjk-font-license before redistributing this font.']
+    (mod_root / 'CREDITS.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
 
 def write_descriptors(mod_root, version, path_value, remote_file_id=None):
@@ -401,7 +621,7 @@ def write_descriptors(mod_root, version, path_value, remote_file_id=None):
             f'picture="thumbnail.png"\nsupported_version="{version}"\n')
     if remote_file_id:
         body += f'remote_file_id="{remote_file_id}"\n'
-    (mod_root / 'descriptor.mod').write_text(body)
+    (mod_root / 'descriptor.mod').write_text(body, encoding='utf-8')
     return body + f'path="{path_value}"\n'
 
 
@@ -413,7 +633,42 @@ def main():
     ap.add_argument('--install', type=Path, nargs='?', const=PROTON_DOCS, default=None,
                     help='copy the built mod into this HOI4 user directory (default: the Proton prefix)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count())
+    ap.add_argument('--cjk-font', type=Path,
+                    help='CJK outline font used for gfx/fonts/chinese (also enables Chinese font output)')
+    ap.add_argument('--cjk-weight', type=float, default=500,
+                    help='wght axis used when the CJK font is variable (default: 500)')
+    ap.add_argument('--cjk-dds-format', choices=('dxt5', 'raw'), default='dxt5',
+                    help='CJK atlas texture format; raw avoids block compression (default: dxt5)')
+    ap.add_argument('--cjk-groups',
+                    help='comma-separated Chinese font groups to build, e.g. standard,hoi_18 (default: all)')
+    ap.add_argument('--cjk-font-license', type=Path,
+                    help='licence text for a custom CJK font; Noto Sans SC OFL is included automatically')
+    ap.add_argument('--mod-name', help='launcher title (defaults to the Chinese title with --cjk-font)')
+    ap.add_argument('--mod-dir', help='mod folder name (defaults to hoi4_hidpi_schinese with --cjk-font)')
     args = ap.parse_args()
+    global MOD_NAME, MOD_DIR
+    MOD_NAME = args.mod_name or ('钢铁雄心 IV｜4K 高清中文字体' if args.cjk_font else MOD_NAME)
+    MOD_DIR = args.mod_dir or ('hoi4_hidpi_schinese' if args.cjk_font else MOD_DIR)
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', MOD_DIR):
+        ap.error('--mod-dir must be a single folder name using letters, digits, underscores or hyphens')
+    if any(c in MOD_NAME for c in ('"', '\n', '\r')):
+        ap.error('--mod-name cannot contain quotes or newlines')
+    if args.cjk_font_license and not args.cjk_font_license.is_file():
+        ap.error('--cjk-font-license must be an existing file')
+
+    if args.cjk_font:
+        cjk_tt = TTFont(args.cjk_font)
+        axes = {axis.axisTag: axis for axis in cjk_tt['fvar'].axes} if 'fvar' in cjk_tt else {}
+        cjk_tt.close()
+        if 'wght' in axes:
+            axis = axes['wght']
+            weight = min(max(args.cjk_weight, axis.minValue), axis.maxValue)
+            if weight != args.cjk_weight:
+                print(f'warning: CJK weight {args.cjk_weight:g} is outside the font axis; using {weight:g}')
+            args.out.joinpath('fonts').mkdir(parents=True, exist_ok=True)
+            cjk_instance = args.out / 'fonts' / f'{args.cjk_font.stem}-wght{weight:g}.ttf'
+            instantiateVariableFont(TTFont(args.cjk_font), {'wght': weight}).save(cjk_instance)
+            args.cjk_font = cjk_instance
 
     fonts_dir = args.game / 'gfx/fonts'
     mod_root = args.out / MOD_DIR
@@ -430,21 +685,43 @@ def main():
         else:
             print(f'warning: {pattern} not installed, {name} will be traced from its bitmap')
 
-    names = referenced_fonts(args.game)
-    jobs = [(n, fonts_dir, out_fonts, outlines.get(n)) for n in names]
+    cjk_groups = ({x.strip() for x in args.cjk_groups.split(',') if x.strip()}
+                  if args.cjk_groups else None)
+    names = referenced_fonts(args.game, include_cjk=args.cjk_font is not None, cjk_groups=cjk_groups)
+    jobs = [(n, fonts_dir, out_fonts, outlines.get(_font_base(n)),
+             str(args.cjk_font) if n.startswith('chinese/') else None, args.cjk_dds_format) for n in names]
     used = {}
     with ProcessPoolExecutor(args.jobs) as pool:
         for name, counts, spec in pool.map(convert, jobs):
             src = Path(spec.ttf).name if spec.ttf else 'bitmap'
             fx = ' +effects' if spec.effects else ''
             print(f'{name:36s} {src:28s}{fx:9s} ' + ' '.join(f'{k}={v}' for k, v in sorted(counts.items())))
-            if counts.get('ttf'):
+            if counts.get('ttf') and not name.startswith('chinese/'):
                 used.setdefault(spec.ttf, []).append(name)
 
     write_patched(args.game, mod_root)
-    write_credits(mod_root, used)
-    shutil.copy(REPO / 'workshop/thumbnail.png', mod_root / 'thumbnail.png')
-    raw = re.search(r'"rawVersion":\s*"(\d+\.\d+)', (args.game / 'launcher-settings.json').read_text())
+    if args.cjk_font:
+        built_groups = {re.sub(r'_\d+of4(?:EX)?$', '', _font_base(name))
+                        for name in names if name.startswith('chinese/')}
+        write_cjk_interface_patches(args.game, mod_root, built_groups)
+        write_country_filter_patch(args.game, mod_root)
+        write_gamesetup_details_patch(args.game, mod_root)
+        write_gamesetup_difficulty_patch(args.game, mod_root)
+        write_national_focus_title_patch(args.game, mod_root)
+        write_font_replacements_patch(
+            args.game, mod_root, 'interface/countrydecisionview.gui',
+            {'hoi_16mbs': 'hoi_18mbs'})
+        write_font_replacements_patch(
+            args.game, mod_root, 'interface/countrytradeview.gui',
+            {'hoi_16mbs': 'hoi_18mbs', 'hoi_18mbs': 'hoi_20bs'})
+        write_font_replacements_patch(
+            args.game, mod_root, 'interface/eventwindow.gui',
+            {'hoi4_typewriter16': 'hoi_18mbs'})
+    write_credits(mod_root, used, [str(args.cjk_font)] if args.cjk_font else (), args.cjk_font_license)
+    workshop = REPO / 'workshop' / 'schinese' if args.cjk_font else REPO / 'workshop'
+    shutil.copy(workshop / 'thumbnail.png', mod_root / 'thumbnail.png')
+    raw = re.search(r'"rawVersion":\s*"(\d+\.\d+)',
+                    (args.game / 'launcher-settings.json').read_text(encoding='utf-8', errors='replace'))
     version = f'{raw.group(1)}.*' if raw else '1.*'
     write_descriptors(mod_root, version, '')
     print(f'built {mod_root}')
@@ -454,12 +731,16 @@ def main():
         dest = user_dir / 'mod' / MOD_DIR
         # Keep the Workshop item id the Paradox launcher adds on upload, so later uploads update it.
         mod_file = user_dir / 'mod' / f'{MOD_DIR}.mod'
-        remote = re.search(r'remote_file_id="(\d+)"', mod_file.read_text()) if mod_file.exists() else None
+        remote = re.search(r'remote_file_id="(\d+)"', mod_file.read_text(encoding='utf-8')) if mod_file.exists() else None
+        if not remote and (dest / 'descriptor.mod').exists():
+            remote = re.search(r'remote_file_id="(\d+)"',
+                               (dest / 'descriptor.mod').read_text(encoding='utf-8'))
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(mod_root, dest)
-        path_value = f'{PROTON_DOCS_WIN}/mod/{MOD_DIR}' if user_dir == PROTON_DOCS else str(dest)
-        mod_file.write_text(write_descriptors(dest, version, path_value, remote and remote.group(1)))
+        path_value = f'{PROTON_DOCS_WIN}/mod/{MOD_DIR}' if user_dir == PROTON_DOCS else dest.as_posix()
+        mod_file.write_text(write_descriptors(dest, version, path_value, remote and remote.group(1)),
+                            encoding='utf-8')
         print(f'installed {dest}')
 
 
